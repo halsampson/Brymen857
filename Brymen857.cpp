@@ -54,7 +54,7 @@ const char* lastActiveComPort() { // to default to last USB serial adapter plugg
   return comPortName;
 
   // see also HKEY_LOCAL_MACHINE\HARDWARE\DEVICEMAP\SERIALCOMM
-  //   can check if disconnect removes from list
+  //   to check disconnect removed from list
   //   can't tell which is last enumerated
 }
 
@@ -74,7 +74,7 @@ bool openSerial(const char* portName) {
   if (!SetupComm(hCom, 16, 64)) return false;
 
   COMMTIMEOUTS timeouts = { 0 };  // in ms
-  timeouts.ReadTotalTimeoutConstant = 1000 + 265;  // for Hz + more for large capacitance (rare)
+  timeouts.ReadTotalTimeoutConstant = 1000 + 265;  // for Hz + more for large capacitance (rare TODO)
   timeouts.ReadIntervalTimeout = 64;  // bulk USB 64 byte partial buffer timeout
   if (!SetCommTimeouts(hCom, &timeouts)) return false;
 
@@ -91,7 +91,8 @@ typedef struct {
 
 rawData raw[RawLen];
 
-// TODO: unknown LCD bits
+
+// TODO: fill in unknown LCD bits
 
 struct {
   union {
@@ -102,7 +103,7 @@ struct {
     };
   };
 
-  BYTE unk00 : 1;
+  BYTE dBm   : 1;
   BYTE milli : 1;
   BYTE micro : 1;
   BYTE Volts : 1;
@@ -115,13 +116,13 @@ struct {
   BYTE Hold : 1;
   BYTE DC : 1;
   BYTE AC : 1;
-  BYTE unk45 : 2;
+  BYTE unk7 : 2;
   BYTE nano : 1;
-  BYTE unk7 : 1;
+  BYTE unk8 : 1;
 
   struct {
-    BYTE segments : 7;
-    BYTE decimalOrMinus : 1;
+    BYTE segments  : 7;
+    BYTE dpOrMinus : 1;
   } lcdDigits[6];
 
   BYTE bar0to5 : 6;
@@ -147,100 +148,132 @@ struct {
 } packed;
 
 
-double decodeRaw() {
+bool packRaw(void) {
   for (int b = 0; b < RawLen; b++)
-    if (raw[b].start != 1 || raw[b].stop != 3) printf("Err %d ", b);  // only 4 bits vary
+    if (raw[b].start != 1 || raw[b].stop != 3) {
+      printf("Err %d ", b);  // only 4 bits vary
+      return false;
+    }
 
   BYTE* p = (BYTE*)&packed;
   rawData* pRaw = raw + 1;
-  do {
+  do { // pack raw nibbles into packed bytes
     *p = (*pRaw++).data << 4;
     *p++ |= (*pRaw++).data;
   } while (pRaw < raw + sizeof(raw));
 
+  packed.switchPos = ~packed.switchPos;  // single bit sent inverted
+  return true;
+}
+
+
+char numStr[8];
+const char* range;
+
+double getLcdValue(void) {
   const char LCDchars[] = "0123456789ELnr-";
-  const char Segments[] = {
+  const char Segments[] = { // 7 segment bits
      0x7D,    5, 0x5B, 0x1F, 0x27, // 0..4
      0x3E, 0x7E, 0x15, 0x7F, 0x3F, // 5..9
      0x7A, 0x68, 0x46, 0x42, 2,    // ELnr-
      0
   };
 
-  char numStr[8];
   char* pNum = numStr;
   for (int digit = 0; digit < sizeof(packed.lcdDigits); digit++) {
-    if (packed.lcdDigits[digit].decimalOrMinus) *pNum++ = digit ? '.' : '-';
+    if (packed.lcdDigits[digit].dpOrMinus) *pNum++ = digit ? '.' : '-';
     if (packed.lcdDigits[digit].segments) { // not blank
       const char* lcdChar = strchr(Segments, (char)(packed.lcdDigits[digit].segments));
       if (lcdChar) *pNum++ = LCDchars[lcdChar - Segments];
-      // else printf("%X ", packed.digits[digit] & 0x7F); // error
     }
   }
   *pNum = 0;
-  double reading = atof(numStr);
+  double value = atof(numStr);
 
-  const char* units[] = { "V", "V", "V", "Hz", "V", "Ohm", "F", "A", "A", "dBm", "%%" };
-  packed.switchPos = ~packed.switchPos;  // single bit
+  range = "";
+  if (!packed.dBm && !packed.percent) {
+    if (packed.nano)  { range = "n"; value *= 1E-9; }
+    if (packed.micro) { range = "u"; value *= 1E-6; }
+    if (packed.milli) { range = "m"; value *= 1E-3; }
+    if (packed.kilo)  { range = "k"; value *= 1E3; }
+    if (packed.Mega)  { range = "M"; value *= 1E6; }
+  }
+  return value;
+}
+
+
+const char* units;
+const char* acdc;
+const char* modifier;
+
+void getUnits(void) {  // sets 3 strings above
+  const char* unitStr[] = { "V", "V", "V", "Hz", "V", "Ohm", "F", "A", "A", "dBm", "%%" };
   BYTE switchPos = 0;
   if (packed.switchPos) {
-    const int log2[9] = { 0, 1, 2, 2, 3, 3, 3, 3, 4 };
+    const int log2[9] = { 0, 1, 2, 2, 3, 3, 3, 3, 4 }; // bit position
     if (packed.swPosMSN)
-         switchPos = 5 - log2[packed.swPosMSN];
+      switchPos = 5 - log2[packed.swPosMSN];
     else switchPos = 4 + log2[packed.swPosLSN];
   }
-
-  const char* range = "";
-  if (switchPos == 0 && !packed.Volts) switchPos = 9; // dBm
+  if (packed.dBm) switchPos = 9; // dBm  
   else if (packed.percent) switchPos = 10; // %
-  else {
-    if (packed.nano)  { range = "n"; reading *= 1E-9; }
-    if (packed.micro) { range = "u"; reading *= 1E-6; }
-    if (packed.milli) { range = "m"; reading *= 1E-3; }
-    if (packed.kilo)  { range = "k"; reading *= 1E3; }
-    if (packed.Mega)  { range = "M"; reading *= 1E6; }
+
+  units = unitStr[switchPos];
+
+  acdc = "";
+  if (packed.AC && packed.DC) {
+    acdc = " AC+DC";
+  } else {
+    if (packed.DC) acdc = "DC";
+    if (packed.AC) acdc = "AC";
   }
 
-  const char* acdc = "";
-  if (packed.DC) acdc = "DC";
-  if (packed.AC) acdc = "AC";
-  if (packed.AC && packed.DC) acdc = "AC+DC";
-
-  const char* modifier = "";
+  modifier = "";
+  if (packed.Rec) modifier = " Rec";
   if (packed.Min) modifier = " Min";
   if (packed.Max) modifier = " Max";
-  if (packed.Rec) modifier = " Rec";
-  if (packed.delta) modifier = " delta";
+  if (packed.delta) modifier = " delta"; 
+  
+  // unknown LCD bits:
+  //printf("%X%X%X%X %X%X%X%X", packed.unk1, packed.unk2, packed.unk3, packed.unk4, packed.unk5, packed.unk6, packed.unk7, packed.unk8);
+}
 
-  // more LCD bits:
-  // printf("  %X %X %X %X", packed.range[1], packed.percent, packed.record, packed.delta); 
+const double MaxErrVal = -8E88;
 
-  printf("%s %s%s%s %s\n", numStr, range, units[switchPos], acdc, modifier);
-
+double decodeRaw(bool doUnits = true) {
+  if (!packRaw()) return -8E88;
+  double reading = getLcdValue();
+  if (doUnits) getUnits();
   return reading;
+}
+
+double getReading(void) {
+  bool ret = SetCommBreak(hCom); // TxD low -> IRED on
+  if (!ret) printf("Break not supported\n");
+  Sleep(1);
+  ret = ClearCommBreak(hCom); // Txd high -> IRED off
+    // NOTE: can leave Tx IRED on constantly
+
+  DWORD bytesRead;
+  if (!ReadFile(hCom, raw, RawLen, &bytesRead, NULL)) return 0;
+  if (bytesRead != RawLen) return -9E99;
+
+  return decodeRaw();
 }
 
 
 int main(int argc, char** argv) {
   const char* comPort = argc > 1 ? argv[1] : lastActiveComPort();
-  if (openSerial(comPort)) {
-    printf("Connected to %s\n", comPort);
-  } else {
-    printf("(Re)connect USB serial adapter or use: Brymen857 COMnn\n");
+  if (!openSerial(comPort)) {
+    printf("(Re)connect USB serial adapter or use:  Brymen857 COMnn\n");
     return -2;
   }
+  printf("Connected to %s\n", comPort);
 
   while (1) {
-    bool ret = SetCommBreak(hCom); // TxD low -> IRED on
-    if (!ret) printf("SetCommBreak not supported\n");
-    Sleep(10);
-    ret = ClearCommBreak(hCom); // Txd high -> IRED off
-      // NOTE: can leave Tx IRED on constantly
-
-    DWORD bytesRead;
-    if (!ReadFile(hCom, raw, RawLen, &bytesRead, NULL)) break;
-    if (bytesRead == RawLen) decodeRaw();
- 
-    Sleep(20);
+    double reading = getReading();
+    if (reading > MaxErrVal)
+      printf("%s %s%s%s %s\n", numStr, range, units, acdc, modifier);
   }
 
   if (hCom) CloseHandle(hCom);
