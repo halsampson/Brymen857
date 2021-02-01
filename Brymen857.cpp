@@ -58,27 +58,26 @@ const char* lastActiveComPort() { // to default to last USB serial adapter plugg
   //   can't tell which is last enumerated
 }
 
-HANDLE hCom;
-bool openSerial(const char* portName) {
+HANDLE openSerial(const char* portName) {
   char portDev[16] = "\\\\.\\";
   strcat_s(portDev, sizeof(portDev), portName);
-  hCom = CreateFileA(portDev, GENERIC_READ | GENERIC_WRITE, 0, NULL, OPEN_EXISTING, NULL, NULL);
-  if (hCom == INVALID_HANDLE_VALUE) return false;
+  HANDLE hCom = CreateFileA(portDev, GENERIC_READ | GENERIC_WRITE, 0, NULL, OPEN_EXISTING, NULL, NULL);
+  if (hCom == INVALID_HANDLE_VALUE) return hCom;
 
   DCB dcb = { 0 };
   dcb.DCBlength = sizeof(DCB);
   dcb.BaudRate = Brymen857Baud;
   dcb.ByteSize = 8;
   dcb.fBinary = TRUE;
-  if (!SetCommState(hCom, &dcb)) return false;
-  if (!SetupComm(hCom, 16, 64)) return false;
+  if (!SetCommState(hCom, &dcb)) return 0;
+  if (!SetupComm(hCom, 16, 64)) return 0;
 
   COMMTIMEOUTS timeouts = { 0 };  // in ms
   timeouts.ReadTotalTimeoutConstant = 1000 + 265;  // for Hz + more for large capacitance (rare TODO)
   timeouts.ReadIntervalTimeout = 64;  // bulk USB 64 byte partial buffer timeout
-  if (!SetCommTimeouts(hCom, &timeouts)) return false;
+  if (!SetCommTimeouts(hCom, &timeouts)) return 0;
 
-  return true;
+  return hCom;
 }
 
 const int RawLen = 35;
@@ -247,7 +246,7 @@ double decodeRaw(bool doUnits = true) {
   return reading;
 }
 
-double getReading(void) {
+double getReading(HANDLE hCom) {
   bool ret = SetCommBreak(hCom); // TxD low -> IRED on
   if (!ret) printf("Break not supported\n");
   Sleep(1);
@@ -261,20 +260,39 @@ double getReading(void) {
   return decodeRaw();
 }
 
-
 int main(int argc, char** argv) {
   const char* comPort = argc > 1 ? argv[1] : lastActiveComPort();
-  if (!openSerial(comPort)) {
+  HANDLE hBrymen = openSerial(comPort);
+  if (hBrymen <= 0) {
     printf("(Re)connect USB serial adapter or use:  Brymen857 COMnn\n");
     return -2;
   }
   printf("Connected to %s\n", comPort);
+  
+  double reading = getReading(hBrymen);
+  if (reading > MaxErrVal)
+    printf("%s %s%s%s %s\n", numStr, range, units, acdc, modifier);
 
-  while (1) {
-    double reading = getReading();
-    if (reading > MaxErrVal)
-      printf("%s %s%s%s %s\n", numStr, range, units, acdc, modifier);
+  if (argc > 2) { // power supply test
+    HANDLE hPSU = openSerial(argv[2]);
+    if (hPSU > 0) {
+      WriteFile(hPSU, "i", 2, NULL, NULL);
+      char identifier[64];
+      if (ReadFile(hPSU, identifier, sizeof(identifier), NULL, NULL))
+        printf("%s\n", identifier);
+
+      for (int mVolts = 200; mVolts <= 36000; mVolts += max(10, mVolts / 30)) {
+        char setVolts[8];
+        _itoa_s(mVolts, setVolts, sizeof(setVolts), 10);
+        strcat_s(setVolts, sizeof(setVolts), "m");
+        WriteFile(hPSU, setVolts, (DWORD)strlen(setVolts), NULL, NULL);
+        Sleep(3000);
+        double reading = getReading(hBrymen);
+        printf("%.3f, %.5f\n", mVolts / 1000., reading);
+      }
+      CloseHandle(hPSU);
+    }
   }
 
-  if (hCom) CloseHandle(hCom);
+  CloseHandle(hBrymen);
 }
