@@ -261,40 +261,73 @@ double getReading(HANDLE hCom) {
   return decodeRaw();
 }
 
+HANDLE hBrymen, hPSU;
+
+void sendPSUCmd(const char* cmd) {
+  WriteFile(hPSU, cmd, (DWORD)strlen(cmd), NULL, NULL);
+}
+
+void calibratePowerSupply(char* psuComPort) {
+  if ((hPSU = openSerial(psuComPort)) <= 0) return;
+
+  sendPSUCmd("I"); // identify
+  char identifier[64];
+  if (ReadFile(hPSU, identifier, sizeof(identifier), NULL, NULL))
+    printf("%s\n", identifier);
+
+  int VcalHi = 10;
+  int VcalLo = 1;
+
+  int R10K = 10000;
+  int offset = 0;
+  int settle_ms = 2000;
+  while (settle_ms <= 10000) {
+    char cmd[8];
+    sprintf_s(cmd, sizeof(cmd), "%dR", R10K);
+    sendPSUCmd(cmd);
+    Sleep(settle_ms);
+    double read10V = getReading(hBrymen);
+
+    sprintf_s(cmd, sizeof(cmd), "%dO", offset);
+    sendPSUCmd(cmd);
+    Sleep(settle_ms);
+    double read1V = getReading(hBrymen);
+
+    R10K = int((R10K + 1000) * (read10V - read1V) / (VcalHi - VcalLo) - 1000 + 0.5);
+    const double OffsetVoltsPerCount = 11 * 1.25 / 16384;
+    offset += int((VcalLo - read1V) / OffsetVoltsPerCount + 0.5); // added to target ADC
+    printf("%d %d\n", R10K, offset);
+
+    settle_ms += settle_ms / 4;
+  }
+
+  for (double volts = 0.5; volts <= 36; volts += max(0.02, volts / 30)) {
+    char setVolts[16];
+    sprintf_s(setVolts, sizeof(setVolts), "%.3fV", volts);
+    WriteFile(hPSU, setVolts, (DWORD)strlen(setVolts), NULL, NULL);
+    Sleep(3000);
+    double reading = getReading(hBrymen);
+    printf("%.3f, %.5f, %.5f\n", volts, volts - reading, reading);
+    // to CSV file also
+  }
+  CloseHandle(hPSU);  
+}
+
 int main(int argc, char** argv) {
   const char* comPort = argc > 1 ? argv[1] : lastActiveComPort();
-  HANDLE hBrymen = openSerial(comPort);
-  if (hBrymen <= 0) {
+  if ((hBrymen = openSerial(comPort)) <= 0) {
     printf("(Re)connect USB serial adapter or use:  Brymen857 COMnn\n");
     return -2;
   }
   printf("Connected to %s\n", comPort);
-  while (1) {
-    double reading = getReading(hBrymen);
-    if (reading > MaxErrVal)
-      printf("%s %s%s %s %s\n", numStr, range, units, acdc, modifier);
-  }
 
-  if (argc > 2) { // power supply test
-    HANDLE hPSU = openSerial(argv[2]);
-    if (hPSU > 0) {
-      WriteFile(hPSU, "i", 2, NULL, NULL);
-      char identifier[64];
-      if (ReadFile(hPSU, identifier, sizeof(identifier), NULL, NULL))
-        printf("%s\n", identifier);
-
-      for (int mVolts = 200; mVolts <= 36000; mVolts += max(10, mVolts / 30)) {
-        char setVolts[8];
-        _itoa_s(mVolts, setVolts, sizeof(setVolts), 10);
-        strcat_s(setVolts, sizeof(setVolts), "m");
-        WriteFile(hPSU, setVolts, (DWORD)strlen(setVolts), NULL, NULL);
-        Sleep(3000);
-        double reading = getReading(hBrymen);
-        printf("%.3f, %.5f\n", mVolts / 1000., reading);
-      }
-      CloseHandle(hPSU);
+  if (argc <= 2) {
+    while (1) {
+      double reading = getReading(hBrymen);
+      if (reading > MaxErrVal)
+        printf("%s %s%s %s %s\n", numStr, range, units, acdc, modifier);
     }
-  }
+  } else calibratePowerSupply(argv[2]);
 
   CloseHandle(hBrymen);
 }
