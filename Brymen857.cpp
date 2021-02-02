@@ -267,36 +267,50 @@ void sendPSUCmd(const char* cmd) {
   WriteFile(hPSU, cmd, (DWORD)strlen(cmd), NULL, NULL);
 }
 
+char* getResponse(const char* cmd) {
+  sendPSUCmd(cmd);
+  static char response[64];
+  DWORD bytesRcvd = 0;
+  if (ReadFile(hPSU, response, sizeof(response), &bytesRcvd, NULL))
+    response[bytesRcvd] = 0;
+  return response;
+}
+
+int getValue(const char* cmd) {
+  return atoi(getResponse(cmd));
+}
+
 void calibratePowerSupply(char* psuComPort) {
   if ((hPSU = openSerial(psuComPort)) <= 0) return;
 
-  sendPSUCmd("I"); // identify
-  char identifier[64];
-  if (ReadFile(hPSU, identifier, sizeof(identifier), NULL, NULL))
-    printf("%s\n", identifier);
+  getResponse("0E"); // Echo off
+  printf("%s\n", getResponse("i")); // identify
 
-  int VcalHi = 10;
+  // set to range of interest:
   int VcalLo = 1;
+  int VcalHi = 10;
 
-  int R10K = 10000;
-  int offset = 0;
-  int settle_ms = 2000;
+  // get calibration
+  int offset = getValue("o");
+  int R10K = getValue("r"); 
+
+  int settle_ms = 5000;
   while (settle_ms <= 10000) {
-    char cmd[8];
-    sprintf_s(cmd, sizeof(cmd), "%dR", R10K);
+    char cmd[32];
+    sprintf_s(cmd, sizeof(cmd), "%dO%dR%dV", offset, R10K, VcalLo);
     sendPSUCmd(cmd);
     Sleep(settle_ms);
-    double read10V = getReading(hBrymen);
+    double readLoV = getReading(hBrymen);
 
-    sprintf_s(cmd, sizeof(cmd), "%dO", offset);
+    sprintf_s(cmd, sizeof(cmd), "%dV", VcalHi);
     sendPSUCmd(cmd);
     Sleep(settle_ms);
-    double read1V = getReading(hBrymen);
+    double readHiV = getReading(hBrymen);
 
-    R10K = int((R10K + 1000) * (read10V - read1V) / (VcalHi - VcalLo) - 1000 + 0.5);
+    R10K = int((R10K + 1000) * (readHiV - readLoV) / (VcalHi - VcalLo) - 1000 + 0.5);
     const double OffsetVoltsPerCount = 11 * 1.25 / 16384;
-    offset += int((VcalLo - read1V) / OffsetVoltsPerCount + 0.5); // added to target ADC
-    printf("%d %d\n", R10K, offset);
+    offset += int((VcalLo - readLoV) / OffsetVoltsPerCount + 0.5); // added to target ADC
+    printf("%d %d\n", offset, R10K);
 
     settle_ms += settle_ms / 4;
   }
