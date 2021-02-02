@@ -115,7 +115,7 @@ struct {
   BYTE Hold : 1;
   BYTE DC : 1;
   BYTE AC : 1;
-  BYTE unk7 : 2; // V; A?
+  BYTE unk7 : 2; // V A?
   BYTE nano : 1;
   BYTE unk8 : 1; // FS?
 
@@ -130,7 +130,7 @@ struct {
 
   BYTE bargraph[5]; // 6 to 45
 
-  BYTE unk2 : 1; 
+  BYTE unk2 : 1;  // T1minusT2?
   BYTE Min  : 1;
   BYTE unk3 : 1;  // Avg ?
   BYTE percent : 1;
