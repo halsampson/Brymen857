@@ -267,9 +267,10 @@ void sendPSUCmd(const char* cmd) {
   WriteFile(hPSU, cmd, (DWORD)strlen(cmd), NULL, NULL);
 }
 
+char response[64];
+
 char* getResponse(const char* cmd) {
   sendPSUCmd(cmd);
-  static char response[64];
   DWORD bytesRcvd = 0;
   if (ReadFile(hPSU, response, sizeof(response), &bytesRcvd, NULL))
     response[bytesRcvd] = 0;
@@ -280,22 +281,20 @@ int getValue(const char* cmd) {
   return atoi(getResponse(cmd));
 }
 
-void calibratePowerSupply(char* psuComPort) {
-  if ((hPSU = openSerial(psuComPort)) <= 0) return;
+// set to range of interest:
+int VcalLo = 1;
+int VcalHi = 10;
 
-  getResponse("0E"); // Echo off
-  printf("%s\n", getResponse("i")); // identify
-
-  // set to range of interest:
-  int VcalLo = 1;
-  int VcalHi = 10;
-
+void calibrateResistor(void) {  // stable: only rarely
   // get calibration
   int offset = getValue("o");
-  int R10K = getValue("r"); 
+  int R10K = getValue("r");
 
   int settle_ms = 5000;
-  while (settle_ms <= 10000) {
+  while (1) {
+    printf("%d %d\n", offset, R10K);
+    if (settle_ms > 10000) break;
+
     char cmd[32];
     sprintf_s(cmd, sizeof(cmd), "%dO%dR%dV", offset, R10K, VcalLo);
     sendPSUCmd(cmd);
@@ -310,10 +309,65 @@ void calibratePowerSupply(char* psuComPort) {
     R10K = int((R10K + 1000) * (readHiV - readLoV) / (VcalHi - VcalLo) - 1000 + 0.5);
     const double OffsetVoltsPerCount = 11 * 1.25 / 16384;
     offset += int((VcalLo - readLoV) / OffsetVoltsPerCount + 0.5); // added to target ADC
-    printf("%d %d\n", offset, R10K);
 
     settle_ms += settle_ms / 4;
   }
+}
+
+int board;
+
+void calibrateVref(void) { // and offset 
+  double temperature = getValue("j") / 100.;
+  printf("%.2fC\n", temperature);
+
+  // get calibration
+  int offset = getValue("o");
+  int ref2p50V = getValue("b");
+
+  int settle_ms = 5000;
+  while (1) {
+    printf("%d %d\n", offset, ref2p50V);
+    if (settle_ms > 10000) break;
+
+    char cmd[32];
+    sprintf_s(cmd, sizeof(cmd), "%dO%dB", offset, ref2p50V);
+    sendPSUCmd(cmd);
+    Sleep(2000);  // wait for calibration averaging
+
+    sprintf_s(cmd, sizeof(cmd), "%dV", VcalLo);
+    sendPSUCmd(cmd);
+    Sleep(settle_ms);
+    double readLoV = getReading(hBrymen);
+
+    sprintf_s(cmd, sizeof(cmd), "%dV", VcalHi);
+    sendPSUCmd(cmd);
+    Sleep(settle_ms);
+    double readHiV = getReading(hBrymen);
+
+    ref2p50V = int(ref2p50V * (readHiV - readLoV) / (VcalHi - VcalLo) + 0.5);
+    const double OffsetVoltsPerCount = 11 * 1.25 / 16384;
+    offset += int((VcalLo - readLoV) / OffsetVoltsPerCount + 0.5); // added to target ADC
+
+    settle_ms += settle_ms / 4;
+  }
+
+  FILE* fCalib;
+  if (!fopen_s(&fCalib, "calib.csv", "a+t")) {
+    char calStr[64];
+    int len = sprintf_s(calStr, sizeof(calStr), "%d, %.2f, %d, %d\n", board, temperature, offset, ref2p50V);
+    fwrite(calStr, 1, len, fCalib);
+    fclose(fCalib);
+  }
+}
+
+void calibratePowerSupply(char* psuComPort) {
+  if ((hPSU = openSerial(psuComPort)) <= 0) return;
+
+  getResponse("0E"); // Echo off
+  printf("%s\n", getResponse("i")); // identify
+  board = atoi(strrchr(response, ' ') + 1);
+
+  calibrateVref();
 
   for (double volts = 0.5; volts <= 36; volts += max(0.02, volts / 30)) {
     char setVolts[16];
