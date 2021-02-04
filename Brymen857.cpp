@@ -272,7 +272,7 @@ char response[64];
 char* getResponse(const char* cmd) {
   sendPSUCmd(cmd);
   DWORD bytesRcvd = 0;
-  if (ReadFile(hPSU, response, sizeof(response), &bytesRcvd, NULL))
+  if (ReadFile(hPSU, response, sizeof(response) - 1, &bytesRcvd, NULL))
     response[bytesRcvd] = 0;
   return response;
 }
@@ -284,7 +284,7 @@ int getValue(const char* cmd) {
 // set to range of interest:
 int VcalLo = 1;
 int VcalHi = 10;
-
+#pragma warning( disable : 26451 )
 void calibrateResistor(void) {  // stable: only rarely
   // get calibration
   int offset = getValue("o");
@@ -317,16 +317,15 @@ void calibrateResistor(void) {  // stable: only rarely
 int board;
 
 void calibrateVref(void) { // and offset 
-  double temperature = getValue("j") / 100.;
-  printf("%.2fC\n", temperature);
-
   // get calibration
   int offset = getValue("o");
   int ref2p50V = getValue("b");
+  double temperature;
 
   int settle_ms = 5000;
   while (1) {
-    printf("%d %d\n", offset, ref2p50V);
+    temperature = getValue("t") / 100.;
+    printf("%d, %.2f, %d, %d\n", board, temperature, offset, ref2p50V);
     if (settle_ms > 10000) break;
 
     char cmd[32];
@@ -351,6 +350,7 @@ void calibrateVref(void) { // and offset
     settle_ms += settle_ms / 4;
   }
 
+  #pragma warning( disable : 6387 )
   FILE* fCalib;
   if (!fopen_s(&fCalib, "calib.csv", "a+t")) {
     char calStr[64];
@@ -360,13 +360,7 @@ void calibrateVref(void) { // and offset
   }
 }
 
-void calibratePowerSupply(char* psuComPort) {
-  if ((hPSU = openSerial(psuComPort)) <= 0) return;
-
-  getResponse("0E"); // Echo off
-  printf("%s\n", getResponse("i")); // identify
-  board = atoi(strrchr(response, ' ') + 1);
-
+void calibratePowerSupply(void) {
   calibrateVref();
 
   for (double volts = 0.5; volts <= 36; volts += max(0.02, volts / 30)) {
@@ -378,8 +372,32 @@ void calibratePowerSupply(char* psuComPort) {
     printf("%.3f, %.5f, %.5f\n", volts, volts - reading, reading);
     // to CSV file also
   }
-  CloseHandle(hPSU);  
 }
+
+void chipTempTest(void) {
+  while (1) {
+    for (int heat = 1; heat >= 0; heat--) {
+      int start = getValue("j");
+      printf("\n%s:", heat ? "Heat" : "Cool");
+      sendPSUCmd(heat ? "65535H" : "0H");  // max or min power
+      for (int t = 0; t < 50; t++) {
+        printf(" %d", getValue("j") - start);
+        Sleep(10000);
+      }
+    }
+  }
+}
+
+void powerSupplyTest(bool brymenOK) {
+  getResponse("0E"); // Echo off
+  printf("%s\n", getResponse("i")); // identify
+  board = atoi(strrchr(response, ' ') + 1);
+  if (brymenOK)
+    calibratePowerSupply();
+  else chipTempTest(); 
+  CloseHandle(hPSU); 
+}
+
 
 int main(int argc, char** argv) {
   const char* comPort = argc > 1 ? argv[1] : lastActiveComPort();
@@ -387,15 +405,19 @@ int main(int argc, char** argv) {
     printf("(Re)connect USB serial adapter or use:  Brymen857 COMnn\n");
     return -2;
   }
-  printf("Connected to %s\n", comPort);
+  bool brymenOK = getReading(hBrymen) > MaxErrVal;
+  if (brymenOK)
+    printf("Brymen connected on %s\n", comPort);
 
-  if (argc <= 2) {
-    while (1) {
-      double reading = getReading(hBrymen);
-      if (reading > MaxErrVal)
-        printf("%s %s%s %s %s\n", numStr, range, units, acdc, modifier);
-    }
-  } else calibratePowerSupply(argv[2]);
+  if ((hPSU = openSerial(argc > 2 ? argv[2] : lastActiveComPort())) > 0)
+    powerSupplyTest(brymenOK);
 
+  
+  while (1) {
+    double reading = getReading(hBrymen);
+    if (reading > MaxErrVal)
+      printf("%s %s%s %s %s\n", numStr, range, units, acdc, modifier);    
+  } 
+  
   CloseHandle(hBrymen);
 }
