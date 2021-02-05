@@ -73,7 +73,7 @@ HANDLE openSerial(const char* portName) {
   if (!SetupComm(hCom, 16, 64)) return 0;
 
   COMMTIMEOUTS timeouts = { 0 };  // in ms
-  timeouts.ReadTotalTimeoutConstant = 1000 + 265;  // for Hz + more for large capacitance (rare TODO)
+  timeouts.ReadTotalTimeoutConstant = 3000 + 265;  // for Hz + more for large capacitance (rare TODO)
   timeouts.ReadIntervalTimeout = 64;  // bulk USB 64 byte partial buffer timeout
   if (!SetCommTimeouts(hCom, &timeouts)) return 0;
 
@@ -377,13 +377,11 @@ void calibratePowerSupply(void) {
 void chipTempTest(void) {
   while (1) {
     for (int heat = 1; heat >= 0; heat--) {
-      int start = getValue("j");
-      printf("\n%s:", heat ? "Heat" : "Cool");
-      sendPSUCmd(heat ? "65535H" : "0H");  // max or min power
-      for (int t = 0; t < 50; t++) {
-        printf(" %d", getValue("j") - start);
-        Sleep(10000);
-      }
+      int start = getValue("t");
+      sendPSUCmd(heat ? "15H" : "0H");  // max or min power
+      printf("\n\n%.2fC %sing...:", start / 200., heat ? "heat" : "cool");
+      for (int t = 0; t < 100; t++) 
+        printf(" %d", getValue("t") - start);
     }
   }
 }
@@ -391,10 +389,13 @@ void chipTempTest(void) {
 void powerSupplyTest(bool brymenOK) {
   getResponse("0E"); // Echo off
   printf("%s\n", getResponse("i")); // identify
-  board = atoi(strrchr(response, ' ') + 1);
-  if (brymenOK)
-    calibratePowerSupply();
-  else chipTempTest(); 
+  char* beforeNum = strrchr(response, ' ');
+  if (beforeNum) {
+    board = atoi(beforeNum + 1);
+    if (brymenOK)
+      calibratePowerSupply();
+    else chipTempTest();
+  }
   CloseHandle(hPSU); 
 }
 
@@ -412,8 +413,7 @@ int main(int argc, char** argv) {
   if ((hPSU = openSerial(argc > 2 ? argv[2] : lastActiveComPort())) > 0)
     powerSupplyTest(brymenOK);
 
-  
-  while (1) {
+  if (brymenOK) while (1) {
     double reading = getReading(hBrymen);
     if (reading > MaxErrVal)
       printf("%s %s%s %s %s\n", numStr, range, units, acdc, modifier);    
