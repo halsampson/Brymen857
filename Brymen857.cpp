@@ -322,6 +322,8 @@ void calibrateVref(void) { // and offset
   int ref2p50V = getValue("b");
   double temperature;
 
+  sendPSUCmd("25T");  // recalibrate; TODO: higher setpoint die temperature for summer
+
   int settle_ms = 5000;
   while (1) {
     temperature = getValue("t") / 100.;
@@ -329,10 +331,6 @@ void calibrateVref(void) { // and offset
     if (settle_ms > 10000) break;
 
     char cmd[32];
-    sprintf_s(cmd, sizeof(cmd), "%dO%dB", offset, ref2p50V);
-    sendPSUCmd(cmd);
-    Sleep(2000);  // wait for calibration averaging
-
     sprintf_s(cmd, sizeof(cmd), "%dV", VcalLo);
     sendPSUCmd(cmd);
     Sleep(settle_ms);
@@ -346,6 +344,10 @@ void calibrateVref(void) { // and offset
     ref2p50V = int(ref2p50V * (readHiV - readLoV) / (VcalHi - VcalLo) + 0.5);
     const double OffsetVoltsPerCount = 11 * 1.25 / 16384;
     offset += int((VcalLo - readLoV) / OffsetVoltsPerCount + 0.5); // added to target ADC
+
+    sprintf_s(cmd, sizeof(cmd), "%dO%dB", offset, ref2p50V);
+    sendPSUCmd(cmd);
+    Sleep(2000);  // wait for calibration averaging
 
     settle_ms += settle_ms / 4;
   }
@@ -379,7 +381,7 @@ void chipTempTest(void) {
     for (int heat = 1; heat >= 0; heat--) {
       int start = getValue("t");
       sendPSUCmd(heat ? "15H" : "0H");  // max or min power
-      printf("\n\n%.2fC %sing...:", start / 200., heat ? "heat" : "cool");
+      printf("\n\n%.2fC %sing...:", start / 100., heat ? "heat" : "cool");
       for (int t = 0; t < 100; t++) 
         printf(" %d", getValue("t") - start);
     }
@@ -387,14 +389,14 @@ void chipTempTest(void) {
 }
 
 void powerSupplyTest(bool brymenOK) {
-  getResponse("0E"); // Echo off
+  getResponse("0I"); // Interactive off
   printf("%s\n", getResponse("i")); // identify
   char* beforeNum = strrchr(response, ' ');
   if (beforeNum) {
     board = atoi(beforeNum + 1);
     if (brymenOK)
       calibratePowerSupply();
-    else chipTempTest();
+    // else chipTempTest();
   }
   CloseHandle(hPSU); 
 }
