@@ -2,6 +2,7 @@
  
 #include "windows.h"
 #include <stdio.h>
+#include <conio.h>
 #include "string.h"
 #include "setupapi.h"
 #pragma comment(lib, "setupAPI.lib")
@@ -282,36 +283,66 @@ int getValue(const char* cmd) {
 }
 
 // set to range of interest:
-int VcalLo = 1;
-int VcalHi = 10;
+double VcalLo = 1.0;
+double VcalHi = 5.0;  // 50000/500000 counts
+
+double readLoV, readHiV;
+
+int settle_ms;
+
+void readLoHiV() {
+  char cmd[32];
+  sprintf_s(cmd, sizeof(cmd), "+%.3fV", VcalLo);
+  sendPSUCmd(cmd);
+  Sleep(settle_ms);
+  readLoV = getReading(hBrymen);
+  printf(" %.5f", readLoV);
+
+  sprintf_s(cmd, sizeof(cmd), "+%.3fV", VcalHi);
+  sendPSUCmd(cmd);
+  Sleep(settle_ms);
+  readHiV = getReading(hBrymen);
+  printf(" %.5f", readHiV);
+}
+
+double slope;
+
+double slopeCorrection() {
+  return slope = (readHiV - readLoV) / (VcalHi - VcalLo);
+}
+
+int R10K;
+int R1K = 1000;
+
+int offsetCorrection() {
+  // TODO: estimate 0-crossing using both points after slope correction
+  readLoV /= slope;
+  readHiV /= slope;
+  double offset = ((VcalLo - readLoV) + (VcalHi - readHiV)) / 2;
+
+  return int(1E6 * offset * R1K / (R10K + R1K) + 0.5); // uV added to target ADC   
+}
+
 #pragma warning( disable : 26451 )
 void calibrateResistor(void) {  // stable: only rarely
   // get calibration
   int offset = getValue("o");
-  int R10K = getValue("r");
 
-  int settle_ms = 5000;
   while (1) {
-    printf("%d %d\n", offset, R10K);
+    printf("\n%d %d", offset, R10K);
     if (settle_ms > 10000) break;
 
     char cmd[32];
-    sprintf_s(cmd, sizeof(cmd), "%dO%dR%dV", offset, R10K, VcalLo);
+    sprintf_s(cmd, sizeof(cmd), "%dO%dR", offset, R10K);
     sendPSUCmd(cmd);
-    Sleep(settle_ms);
-    double readLoV = getReading(hBrymen);
 
-    sprintf_s(cmd, sizeof(cmd), "%dV", VcalHi);
-    sendPSUCmd(cmd);
-    Sleep(settle_ms);
-    double readHiV = getReading(hBrymen);
-
-    R10K = int((R10K + 1000) * (readHiV - readLoV) / (VcalHi - VcalLo) - 1000 + 0.5);
-    const double OffsetVoltsPerCount = 11 * 1.25 / 16384;
-    offset += int((VcalLo - readLoV) / OffsetVoltsPerCount + 0.5); // added to target ADC
+    readLoHiV();
+    R10K = int((R10K + R1K) * slopeCorrection() - R1K + 0.5);
+    offset += offsetCorrection();
 
     settle_ms += settle_ms / 4;
   }
+  printf("\n");
 }
 
 int board;
@@ -321,34 +352,23 @@ void calibrateVref(void) { // and offset
   int offset = getValue("o");
   int ref2p50V = getValue("b");
   double temperature;
+  char cmd[32];
 
-  sendPSUCmd("25T");  // recalibrate; TODO: higher setpoint die temperature for summer
+  sendPSUCmd("27T");  // recalibrate; TODO: higher setpoint die temperature for summer
 
-  int settle_ms = 5000;
+  settle_ms = 8000;
   while (1) {
     temperature = getValue("t") / 100.;
-    printf("%d, %.2f, %d, %d\n", board, temperature, offset, ref2p50V);
-    if (settle_ms > 10000) break;
+    printf("\n%d, %.2f, %d, %d", board, temperature, offset, ref2p50V);
+    if (settle_ms > 15000) break;
 
-    char cmd[32];
-    sprintf_s(cmd, sizeof(cmd), "%dV", VcalLo);
-    sendPSUCmd(cmd);
-    Sleep(settle_ms);
-    double readLoV = getReading(hBrymen);
-
-    sprintf_s(cmd, sizeof(cmd), "%dV", VcalHi);
-    sendPSUCmd(cmd);
-    Sleep(settle_ms);
-    double readHiV = getReading(hBrymen);
-
-    ref2p50V = int(ref2p50V * (readHiV - readLoV) / (VcalHi - VcalLo) + 0.5);
-    const double OffsetVoltsPerCount = 11 * 1.25 / 16384;
-    offset += int((VcalLo - readLoV) / OffsetVoltsPerCount + 0.5); // added to target ADC
+    readLoHiV();
+    ref2p50V = int(ref2p50V * slopeCorrection() + 0.5);
+    offset += offsetCorrection();
 
     sprintf_s(cmd, sizeof(cmd), "%dO%dB", offset, ref2p50V);
     sendPSUCmd(cmd);
-    Sleep(2000);  // wait for calibration averaging
-
+    Sleep(3000);  // wait for calibration averaging
     settle_ms += settle_ms / 4;
   }
 
@@ -360,10 +380,19 @@ void calibrateVref(void) { // and offset
     fwrite(calStr, 1, len, fCalib);
     fclose(fCalib);
   }
+
+  sprintf_s(cmd, sizeof(cmd), "%.3fV", VcalHi);
+  sendPSUCmd(cmd);
+  printf("\n");
 }
 
 void calibratePowerSupply(void) {
-  calibrateVref();
+  R10K = getValue("r");
+  settle_ms = 5000;
+  do {
+    calibrateVref();
+    printf("Calibrated ...\n");
+  } while (_getch() == ' ');
 
   for (double volts = 0.5; volts <= 36; volts += max(0.02, volts / 30)) {
     char setVolts[16];
@@ -412,7 +441,9 @@ int main(int argc, char** argv) {
   if (brymenOK)
     printf("Brymen connected on %s\n", comPort);
 
-  if ((hPSU = openSerial(argc > 2 ? argv[2] : lastActiveComPort())) > 0)
+  if ((hPSU = openSerial(argc > 2 ? argv[2] : lastActiveComPort())) > 0
+  || (hPSU = openSerial("COM7")) > 0
+  || (hPSU = openSerial("COM8")) > 0)
     powerSupplyTest(brymenOK);
 
   if (brymenOK) while (1) {
