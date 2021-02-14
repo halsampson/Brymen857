@@ -3,7 +3,8 @@
 #include "windows.h"
 #include <stdio.h>
 #include <conio.h>
-#include "string.h"
+#include <math.h>
+#include <string.h>
 #include "setupapi.h"
 #pragma comment(lib, "setupAPI.lib")
 
@@ -251,13 +252,13 @@ double decodeRaw(bool doUnits = true) {
 double getReading(HANDLE hCom) {
   bool ret = SetCommBreak(hCom); // TxD low -> IRED on
   if (!ret) printf("Break not supported\n");
-  Sleep(1);
+  Sleep(8);
   ret = ClearCommBreak(hCom); // Txd high -> IRED off
     // NOTE: can leave Tx IRED on constantly
 
   DWORD bytesRead;
   if (!ReadFile(hCom, raw, RawLen, &bytesRead, NULL)) return 0;
-  if (bytesRead != RawLen) return -9E99;
+  if (bytesRead != RawLen) return -9E99;  // TODO: retry
 
   return decodeRaw();
 }
@@ -282,33 +283,61 @@ int getValue(const char* cmd) {
   return atoi(getResponse(cmd));
 }
 
+char cmd[32];
+int settle_ms;
+
+// beware synchronizing with noise???
+double avgReading(HANDLE hMeter) { // median
+  while (1) {
+    const int NAVG = 4 * 2 + 1;
+    double val[NAVG];
+    for (int n = 0; n < NAVG; n++) {
+      double newval = getReading(hMeter);
+      int newpos = n;
+      for (int i = 0; i < n; i++)
+        if (newval < val[i]) {   // keep sorted
+          newpos = i;
+          for (int j = n; j > i; j--)
+            val[j] = val[j - 1];
+          break;
+        }
+      val[newpos] = newval;
+    }
+    if (fabs(val[NAVG / 2] - 1) > 0.02 && fabs(val[NAVG / 2] - 5) > 0.02) {
+      for (int n = 0; n < NAVG; n++)
+        printf(" %.4f", val[n]);
+      sendPSUCmd(cmd);
+      Sleep(settle_ms);
+    }
+    else return val[NAVG / 2]; // median
+  }
+}
+
+
 // set to range of interest:
 double VcalLo = 1.0;
 double VcalHi = 5.0;  // 50000/500000 counts
 
 double readLoV, readHiV;
 
-int settle_ms;
-
 void readLoHiV() {
-  char cmd[32];
   sprintf_s(cmd, sizeof(cmd), "+%.3fV", VcalLo);
   sendPSUCmd(cmd);
   Sleep(settle_ms);
-  readLoV = getReading(hBrymen);
-  printf(" %.5f", readLoV);
+  readLoV = avgReading(hBrymen);
+  printf(" %+.5f", readLoV - VcalLo);
 
   sprintf_s(cmd, sizeof(cmd), "+%.3fV", VcalHi);
   sendPSUCmd(cmd);
   Sleep(settle_ms);
-  readHiV = getReading(hBrymen);
-  printf(" %.5f", readHiV);
+  readHiV = avgReading(hBrymen);
+  printf(" %+.5f", readHiV - VcalHi);
 }
 
 double slope;
 
 double slopeCorrection() {
-  return slope = (readHiV - readLoV) / (VcalHi - VcalLo);
+  return slope = sqrt((readHiV - readLoV) / (VcalHi - VcalLo));
 }
 
 int R10K;
@@ -316,10 +345,7 @@ int R1K = 1000;
 
 int offsetCorrection() {
   // TODO: estimate 0-crossing using both points after slope correction
-  readLoV /= slope;
-  readHiV /= slope;
-  double offset = ((VcalLo - readLoV) + (VcalHi - readHiV)) / 2;
-
+  double offset = ((VcalLo - readLoV / slope) + (VcalHi - readHiV / slope)) / 2;  // ??? ???? 
   return int(1E6 * offset * R1K / (R10K + R1K) + 0.5); // uV added to target ADC   
 }
 
@@ -333,7 +359,7 @@ void calibrateResistor(void) {  // stable: only rarely
     if (settle_ms > 10000) break;
 
     char cmd[32];
-    sprintf_s(cmd, sizeof(cmd), "%dO%dR", offset, R10K);
+    sprintf_s(cmd, sizeof(cmd), "+%dO+%dR", offset, R10K);
     sendPSUCmd(cmd);
 
     readLoHiV();
@@ -362,11 +388,12 @@ void calibrateVref(void) { // and offset
     printf("\n%d, %.2f, %d, %d", board, temperature, offset, ref2p50V);
     if (settle_ms > 15000) break;
 
+
     readLoHiV();
     ref2p50V = int(ref2p50V * slopeCorrection() + 0.5);
     offset += offsetCorrection();
 
-    sprintf_s(cmd, sizeof(cmd), "%dO%dB", offset, ref2p50V);
+    sprintf_s(cmd, sizeof(cmd), "+%dO+%dB", offset, ref2p50V);
     sendPSUCmd(cmd);
     Sleep(3000);  // wait for calibration averaging
     settle_ms += settle_ms / 4;
@@ -392,7 +419,7 @@ void calibratePowerSupply(void) {
   do {
     calibrateVref();
     printf("Calibrated ...\n");
-  } while (_getch() == ' ');
+  } while (1 || _getch() == ' ');
 
   for (double volts = 0.5; volts <= 36; volts += max(0.02, volts / 30)) {
     char setVolts[16];
