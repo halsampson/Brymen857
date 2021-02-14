@@ -289,7 +289,7 @@ int settle_ms;
 // beware synchronizing with noise???
 double avgReading(HANDLE hMeter) { // median
   while (1) {
-    const int NAVG = 4 * 2 + 1;
+    const int NAVG = 16 * 2 + 1;
     double val[NAVG];
     for (int n = 0; n < NAVG; n++) {
       double newval = getReading(hMeter);
@@ -303,20 +303,22 @@ double avgReading(HANDLE hMeter) { // median
         }
       val[newpos] = newval;
     }
-    if (fabs(val[NAVG / 2] - 1) > 0.02 && fabs(val[NAVG / 2] - 5) > 0.02) {
+
+    if (fabs(val[NAVG / 2] - 1) > 0.01 && fabs(val[NAVG / 2] - 5) > 0.01) {
       for (int n = 0; n < NAVG; n++)
         printf(" %.4f", val[n]);
       sendPSUCmd(cmd);
       Sleep(settle_ms);
     }
+
     else return val[NAVG / 2]; // median
   }
 }
 
 
 // set to range of interest:
-double VcalLo = 1.0;
-double VcalHi = 5.0;  // 50000/500000 counts
+const double VcalLo = 1.0;
+const double VcalHi = 5.0;  // 50000/500000 counts
 
 double readLoV, readHiV;
 
@@ -325,28 +327,28 @@ void readLoHiV() {
   sendPSUCmd(cmd);
   Sleep(settle_ms);
   readLoV = avgReading(hBrymen);
-  printf(" %+.5f", readLoV - VcalLo);
+  printf(" %+5.0f", (readLoV - VcalLo) * 1E6);
 
   sprintf_s(cmd, sizeof(cmd), "+%.3fV", VcalHi);
   sendPSUCmd(cmd);
   Sleep(settle_ms);
   readHiV = avgReading(hBrymen);
-  printf(" %+.5f", readHiV - VcalHi);
+  printf(" %+5.0f", (readHiV - VcalHi) * 1E6);
 }
 
-double slope;
-
 double slopeCorrection() {
-  return slope = sqrt((readHiV - readLoV) / (VcalHi - VcalLo));
+  double slope = (readHiV - readLoV) / (VcalHi - VcalLo);
+  printf(" %+5.0f", (slope - 1) * 1E6 * (VcalHi - VcalLo));
+  return slope;
 }
 
 int R10K;
 int R1K = 1000;
 
 int offsetCorrection() {
-  // TODO: estimate 0-crossing using both points after slope correction
-  double offset = ((VcalLo - readLoV / slope) + (VcalHi - readHiV / slope)) / 2;  // ??? ???? 
-  return int(1E6 * offset * R1K / (R10K + R1K) + 0.5); // uV added to target ADC   
+  double offset = 1E6 * (readLoV * VcalHi - readHiV * VcalLo) / (VcalHi - VcalLo); // uV at output
+  printf(" %+5.0f", offset); 
+  return int(offset * R1K / (R10K + R1K) + 0.5); // uV off from target ADC 
 }
 
 #pragma warning( disable : 26451 )
@@ -364,7 +366,7 @@ void calibrateResistor(void) {  // stable: only rarely
 
     readLoHiV();
     R10K = int((R10K + R1K) * slopeCorrection() - R1K + 0.5);
-    offset += offsetCorrection();
+    offset -= offsetCorrection();
 
     settle_ms += settle_ms / 4;
   }
@@ -385,13 +387,12 @@ void calibrateVref(void) { // and offset
   settle_ms = 8000;
   while (1) {
     temperature = getValue("t") / 100.;
-    printf("\n%d, %.2f, %d, %d", board, temperature, offset, ref2p50V);
-    if (settle_ms > 15000) break;
-
+    printf("\n%d, %.2f, %4d, %d", board, temperature, offset, ref2p50V);
+    if (settle_ms > 20000) break;
 
     readLoHiV();
     ref2p50V = int(ref2p50V * slopeCorrection() + 0.5);
-    offset += offsetCorrection();
+    offset -= offsetCorrection();
 
     sprintf_s(cmd, sizeof(cmd), "+%dO+%dB", offset, ref2p50V);
     sendPSUCmd(cmd);
@@ -403,7 +404,7 @@ void calibrateVref(void) { // and offset
   FILE* fCalib;
   if (!fopen_s(&fCalib, "calib.csv", "a+t")) {
     char calStr[64];
-    int len = sprintf_s(calStr, sizeof(calStr), "%d, %.2f, %d, %d\n", board, temperature, offset, ref2p50V);
+    int len = sprintf_s(calStr, sizeof(calStr), "%d, %.2f, %4d, %d\n", board, temperature, offset, ref2p50V);
     fwrite(calStr, 1, len, fCalib);
     fclose(fCalib);
   }
