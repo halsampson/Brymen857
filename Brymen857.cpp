@@ -286,10 +286,17 @@ int getValue(const char* cmd) {
 char cmd[32];
 int settle_ms;
 
+// set to range of interest:
+const double VcalLo = 1.0;
+const double VcalHi = 5.0;  // 50000/500000 counts
+
 // beware synchronizing with noise???
 double avgReading(HANDLE hMeter) { // median
   while (1) {
-    const int NAVG = 16 * 2 + 1;
+    // printf(" %5d %2d %5d", getValue("x"), getValue("p"), getValue("y"));
+    printf(" %5d", getValue("y"));
+
+    const int NAVG = 8 * 2 + 1;
     double val[NAVG];
     for (int n = 0; n < NAVG; n++) {
       double newval = getReading(hMeter);
@@ -304,19 +311,13 @@ double avgReading(HANDLE hMeter) { // median
       val[newpos] = newval;
     }
 
-    printf(" %d", getValue("p"));
-    if (fabs(val[NAVG / 2] - 1) > 0.01 && fabs(val[NAVG / 2] - 5) > 0.01) {      
+    if (fabs(val[NAVG-1] - val[0]) > 0.001) {
       printf(" unstable: %.0f", (val[NAVG-1] - val[0]) * 1E6);
       sendPSUCmd(cmd);  // resend "nnnnV" cmd
       Sleep(settle_ms);
     } else return val[NAVG / 2]; // median
   }
 }
-
-
-// set to range of interest:
-const double VcalLo = 1.0;
-const double VcalHi = 5.0;  // 50000/500000 counts
 
 double readLoV, readHiV;
 
@@ -382,20 +383,22 @@ void calibrateVref(void) { // and offset
 
   sendPSUCmd("27T");  // recalibrate; TODO: higher setpoint die temperature for summer
 
-  settle_ms = 8000;
+  settle_ms = 6000;
   while (1) {
     temperature = getValue("t") / 100.;
     printf("\n%d, %.2f, %4d, %d", board, temperature, offset, ref2p50V);
-    if (settle_ms > 20000) break;
+    if (settle_ms > 16000) break;
 
     readLoHiV();
-    ref2p50V = int(ref2p50V * sqrt(slopeCorrection()) + 0.5);  // gain < 1 to attenuate noise
-    offset -= offsetCorrection() / 2;
+    ref2p50V = int(ref2p50V * sqrt(slopeCorrection()) + 0.5);  // gain < 1 to attenuate sampling noise
+    offset -= offsetCorrection() / 2; // gain < 1 to attenuate noise
+    // NOTE: servo resolution is 210uV
+    // TODO: check for 'p'ull effect?
 
     sprintf_s(cmd, sizeof(cmd), "+%dO+%dB", offset, ref2p50V);
     sendPSUCmd(cmd);
-    Sleep(3000);  // wait for calibration averaging
-    settle_ms += settle_ms / 4;
+    Sleep(2000);  // wait for calibration averaging
+    settle_ms += 0; // settle_ms / 4;
   }
 
   #pragma warning( disable : 6387 )
