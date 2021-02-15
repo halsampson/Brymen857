@@ -304,14 +304,12 @@ double avgReading(HANDLE hMeter) { // median
       val[newpos] = newval;
     }
 
-    if (fabs(val[NAVG / 2] - 1) > 0.01 && fabs(val[NAVG / 2] - 5) > 0.01) {
-      for (int n = 0; n < NAVG; n++)
-        printf(" %.4f", val[n]);
-      sendPSUCmd(cmd);
+    printf(" %d", getValue("p"));
+    if (fabs(val[NAVG / 2] - 1) > 0.01 && fabs(val[NAVG / 2] - 5) > 0.01) {      
+      printf(" unstable: %.0f", (val[NAVG-1] - val[0]) * 1E6);
+      sendPSUCmd(cmd);  // resend "nnnnV" cmd
       Sleep(settle_ms);
-    }
-
-    else return val[NAVG / 2]; // median
+    } else return val[NAVG / 2]; // median
   }
 }
 
@@ -391,8 +389,8 @@ void calibrateVref(void) { // and offset
     if (settle_ms > 20000) break;
 
     readLoHiV();
-    ref2p50V = int(ref2p50V * slopeCorrection() + 0.5);
-    offset -= offsetCorrection();
+    ref2p50V = int(ref2p50V * sqrt(slopeCorrection()) + 0.5);  // gain < 1 to attenuate noise
+    offset -= offsetCorrection() / 2;
 
     sprintf_s(cmd, sizeof(cmd), "+%dO+%dB", offset, ref2p50V);
     sendPSUCmd(cmd);
@@ -417,10 +415,8 @@ void calibrateVref(void) { // and offset
 void calibratePowerSupply(void) {
   R10K = getValue("r");
   settle_ms = 5000;
-  do {
-    calibrateVref();
-    printf("Calibrated ...\n");
-  } while (1 || _getch() == ' ');
+  do calibrateVref();
+  while (!_kbhit());
 
   for (double volts = 0.5; volts <= 36; volts += max(0.02, volts / 30)) {
     char setVolts[16];
