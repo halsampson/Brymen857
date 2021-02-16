@@ -325,13 +325,13 @@ void readLoHiV() {
   sprintf_s(cmd, sizeof(cmd), "+%.3fV", VcalLo);
   sendPSUCmd(cmd);
   Sleep(settle_ms);
-  readLoV = avgReading(hBrymen);
+  do readLoV = avgReading(hBrymen); while (readLoV <= MaxErrVal);
   printf(" %+5.0f", (readLoV - VcalLo) * 1E6);
 
   sprintf_s(cmd, sizeof(cmd), "+%.3fV", VcalHi);
   sendPSUCmd(cmd);
   Sleep(settle_ms);
-  readHiV = avgReading(hBrymen);
+  do readHiV = avgReading(hBrymen); while (readHiV <= MaxErrVal);
   printf(" %+5.0f", (readHiV - VcalHi) * 1E6);
 }
 
@@ -374,7 +374,7 @@ void calibrateResistor(void) {  // stable: only rarely
 
 int board;
 
-void calibrateVref(void) { // and offset 
+void calibrateVref(bool adjust = true) { // and offset 
   // get calibration
   int offset = getValue("o");
   int ref2p50V = getValue("b");
@@ -384,22 +384,24 @@ void calibrateVref(void) { // and offset
   sendPSUCmd("27T");  // recalibrate; TODO: higher setpoint die temperature for summer
 
   settle_ms = 6000;
-  while (1) {
+  do {
     temperature = getValue("t") / 100.;
     printf("\n%d, %.2f, %4d, %d", board, temperature, offset, ref2p50V);
     if (settle_ms > 16000) break;
 
     readLoHiV();
-    ref2p50V = int(ref2p50V * sqrt(slopeCorrection()) + 0.5);  // gain < 1 to attenuate sampling noise
-    offset -= offsetCorrection() / 2; // gain < 1 to attenuate noise
-    // NOTE: servo resolution is 210uV
-    // TODO: check for 'p'ull effect?
+    if (adjust) {
+      ref2p50V = int(ref2p50V * slopeCorrection() + 0.5);  // gain < 1 to attenuate sampling noise
+      offset -= offsetCorrection(); // gain < 1 to attenuate noise
+      // NOTE: servo resolution is 210uV
 
-    sprintf_s(cmd, sizeof(cmd), "+%dO+%dB", offset, ref2p50V);
-    sendPSUCmd(cmd);
-    Sleep(2000);  // wait for calibration averaging
+      sprintf_s(cmd, sizeof(cmd), "+%dO+%dB", offset, ref2p50V);
+      sendPSUCmd(cmd);
+      Sleep(2000);  // wait for calibration averaging
+    }
+
     settle_ms += 0; // settle_ms / 4;
-  }
+  } while (!_kbhit());
 
   #pragma warning( disable : 6387 )
   FILE* fCalib;
@@ -417,9 +419,12 @@ void calibrateVref(void) { // and offset
 
 void calibratePowerSupply(void) {
   R10K = getValue("r");
-  settle_ms = 5000;
-  do calibrateVref();
-  while (!_kbhit());
+  bool adjust = false;
+  while (1) {
+    do calibrateVref(adjust);
+    while (!_kbhit());
+    adjust = _getch() == 'a';
+  }
 
   for (double volts = 0.5; volts <= 36; volts += max(0.02, volts / 30)) {
     char setVolts[16];
