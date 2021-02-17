@@ -240,10 +240,10 @@ void getUnits(void) {  // sets 3 strings above
   // printf("%X %X%X%X%X %X%X%X%X ", raw[0].data, packed.unk1, packed.unk2, packed.unk3, packed.unk4, packed.unk5, packed.unk6, packed.unk7, packed.unk8);
 }
 
-const double MaxErrVal = -8E88;
+const double MinErrVal = 1E9;
 
 double decodeRaw(bool doUnits = true) {
-  if (!packRaw()) return -8E88;
+  if (!packRaw()) return 9E9;
   double reading = getLcdValue();
   if (doUnits) getUnits();
   return reading;
@@ -258,7 +258,7 @@ double getReading(HANDLE hCom) {
 
   DWORD bytesRead;
   if (!ReadFile(hCom, raw, RawLen, &bytesRead, NULL)) return 0;
-  if (bytesRead != RawLen) return -9E99;  // TODO: retry
+  if (bytesRead != RawLen) return 9E9;  // TODO: retry
 
   return decodeRaw();
 }
@@ -287,19 +287,20 @@ char cmd[32];
 int settle_ms;
 
 // set to range of interest:
-const double VcalLo = 1.0;
+const double VcalLo = 2.0;
 const double VcalHi = 5.0;  // 50000/500000 counts
 
 // beware synchronizing with noise???
 double avgReading(HANDLE hMeter) { // median
   while (1) {
     // printf(" %5d %2d %5d", getValue("x"), getValue("p"), getValue("y"));
-    printf(" %5d", getValue("y"));
+    // printf(" %5d", getValue("y"));
 
     const int NAVG = 8 * 2 + 1;
     double val[NAVG];
     for (int n = 0; n < NAVG; n++) {
-      double newval = getReading(hMeter);
+      double newval;
+      do newval = getReading(hMeter); while (newval >= MinErrVal);
       int newpos = n;
       for (int i = 0; i < n; i++)
         if (newval < val[i]) {   // keep sorted
@@ -325,13 +326,13 @@ void readLoHiV() {
   sprintf_s(cmd, sizeof(cmd), "+%.3fV", VcalLo);
   sendPSUCmd(cmd);
   Sleep(settle_ms);
-  do readLoV = avgReading(hBrymen); while (readLoV <= MaxErrVal);
+  readLoV = avgReading(hBrymen);
   printf(" %+5.0f", (readLoV - VcalLo) * 1E6);
 
   sprintf_s(cmd, sizeof(cmd), "+%.3fV", VcalHi);
   sendPSUCmd(cmd);
   Sleep(settle_ms);
-  do readHiV = avgReading(hBrymen); while (readHiV <= MaxErrVal);
+  readHiV = avgReading(hBrymen);
   printf(" %+5.0f", (readHiV - VcalHi) * 1E6);
 }
 
@@ -383,10 +384,11 @@ void calibrateVref(bool adjust = true) { // and offset
 
   sendPSUCmd("27T");  // recalibrate; TODO: higher setpoint die temperature for summer
 
-  settle_ms = 6000;
+  settle_ms = 8000;
   do {
     temperature = getValue("t") / 100.;
-    printf("\n%d, %.2f, %4d, %d", board, temperature, offset, ref2p50V);
+    // printf("\n%d, %.2f, %4d, %d", board, temperature, offset, ref2p50V);
+    printf("\n%d, %.2f,", board, temperature);
     if (settle_ms > 16000) break;
 
     readLoHiV();
@@ -469,7 +471,7 @@ int main(int argc, char** argv) {
     printf("(Re)connect USB serial adapter or use:  Brymen857 COMnn\n");
     return -2;
   }
-  bool brymenOK = getReading(hBrymen) > MaxErrVal;
+  bool brymenOK = getReading(hBrymen) < MinErrVal;
   if (brymenOK)
     printf("Brymen connected on %s\n", comPort);
 
@@ -480,7 +482,7 @@ int main(int argc, char** argv) {
 
   if (brymenOK) while (1) {
     double reading = getReading(hBrymen);
-    if (reading > MaxErrVal)
+    if (reading < MinErrVal)
       printf("%s %s%s %s %s\n", numStr, range, units, acdc, modifier);    
   } 
   
