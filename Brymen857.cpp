@@ -284,7 +284,7 @@ int getValue(const char* cmd) {
 }
 
 char cmd[32];
-int settle_ms;
+int settle_ms = 2000;
 
 // set to range of interest:
 const double VcalLo = 2.0;
@@ -292,11 +292,10 @@ const double VcalHi = 5.0;  // 50000/500000 counts
 
 // beware synchronizing with noise???
 double avgReading(HANDLE hMeter) { // median
+  sendPSUCmd(cmd);
+  Sleep(settle_ms);
   while (1) {
-    // printf(" %5d %2d %5d", getValue("x"), getValue("p"), getValue("y"));
-    // printf(" %5d", getValue("y"));
-
-    const int NAVG = 8 * 2 + 1;
+    const int NAVG = 50 * 2 + 1;  // beats with 60 Hz
     double val[NAVG];
     for (int n = 0; n < NAVG; n++) {
       double newval;
@@ -314,114 +313,69 @@ double avgReading(HANDLE hMeter) { // median
 
     if (fabs(val[NAVG-1] - val[0]) > 0.001) {
       printf(" unstable: %.0f", (val[NAVG-1] - val[0]) * 1E6);
-      sendPSUCmd(cmd);  // resend "nnnnV" cmd
       Sleep(settle_ms);
     } else return val[NAVG / 2]; // median
   }
 }
 
+const int DAC_SCALE = 4096;
+int dacLo, dacHi;
 double readLoV, readHiV;
+int maxVout[5], offset;
+int ref;
 
 void readLoHiV() {
-  sprintf_s(cmd, sizeof(cmd), "+%.3fV", VcalLo);
-  sendPSUCmd(cmd);
-  Sleep(settle_ms);
+  sprintf_s(cmd, sizeof(cmd), "+%dD", dacLo = int(DAC_SCALE * (VcalLo * 1E6 + offset) / maxVout[ref] + 0.5));
   readLoV = avgReading(hBrymen);
-  printf(" %+5.0f", (readLoV - VcalLo) * 1E6);
 
-  sprintf_s(cmd, sizeof(cmd), "+%.3fV", VcalHi);
-  sendPSUCmd(cmd);
-  Sleep(settle_ms);
+  sprintf_s(cmd, sizeof(cmd), "+%dD", dacHi = int(DAC_SCALE * (VcalHi * 1E6 + offset) / maxVout[ref] + 0.5));
   readHiV = avgReading(hBrymen);
-  printf(" %+5.0f", (readHiV - VcalHi) * 1E6);
 }
 
-double slopeCorrection() {
-  double slope = (readHiV - readLoV) / (VcalHi - VcalLo);
-  printf(" %+5.0f", (slope - 1) * 1E6 * (VcalHi - VcalLo));
-  return slope;
-}
-
-int R10K;
-int R1K = 1000;
-
-int offsetCorrection() {
-  double offset = 1E6 * (readLoV * VcalHi - readHiV * VcalLo) / (VcalHi - VcalLo); // uV at output
-  printf(" %+5.0f", offset); 
-  return int(offset * R1K / (R10K + R1K) + 0.5); // uV off from target ADC 
-}
-
-#pragma warning( disable : 26451 )
-void calibrateResistor(void) {  // stable: only rarely
-  // get calibration
-  int offset = getValue("o");
-
-  while (1) {
-    printf("\n%d %d", offset, R10K);
-    if (settle_ms > 10000) break;
-
-    char cmd[32];
-    sprintf_s(cmd, sizeof(cmd), "+%dO+%dR", offset, R10K);
-    sendPSUCmd(cmd);
-
-    readLoHiV();
-    R10K = int((R10K + R1K) * slopeCorrection() - R1K + 0.5);
-    offset -= offsetCorrection();
-
-    settle_ms += settle_ms / 4;
-  }
-  printf("\n");
-}
+#pragma warning( disable : 26451)
+#pragma warning( disable : 6387)
 
 int board;
 
 void calibrateVref(bool adjust = true) { // and offset 
-  // get calibration
-  int offset = getValue("o");
-  int ref2p50V = getValue("b");
-  double temperature;
-  char cmd[32];
+  for (ref = 0; ref < 5; ref++) {
+    Sleep(100);
+    sprintf_s(cmd, sizeof(cmd), "+%d ", ref); // set param0 = REFSEL
+    sendPSUCmd(cmd);
+    Sleep(100);
 
-  sendPSUCmd("27T");  // recalibrate; TODO: higher setpoint die temperature for summer
-
-  settle_ms = 8000;
-  do {
-    temperature = getValue("t") / 100.;
-    // printf("\n%d, %.2f, %4d, %d", board, temperature, offset, ref2p50V);
-    printf("\n%d, %.2f,", board, temperature);
-    if (settle_ms > 16000) break;
+    double temperature = getValue("t") / 100.;
+    // get calibration
+    offset = getValue("o");
+    maxVout[ref] = getValue("b");    
+    char cmd[32];
 
     readLoHiV();
     if (adjust) {
-      ref2p50V = int(ref2p50V * slopeCorrection() + 0.5);  // gain < 1 to attenuate sampling noise
-      offset -= offsetCorrection(); // gain < 1 to attenuate noise
-      // NOTE: servo resolution is 210uV
-
-      sprintf_s(cmd, sizeof(cmd), "+%dO+%dB", offset, ref2p50V);
+      int prevmaxVout = maxVout[ref];
+      maxVout[ref] = int(1E6 * (readHiV - readLoV) * DAC_SCALE / (dacHi - dacLo) + 0.5); // uV
+      offset = -int(1E6 * (readLoV * dacHi - readHiV * dacLo) / (dacHi - dacLo) + 0.5); // uV at output
+      sprintf_s(cmd, sizeof(cmd), "+%dO+%dB", offset, maxVout[ref]);
       sendPSUCmd(cmd);
-      Sleep(2000);  // wait for calibration averaging
+
+      FILE* fCalib;
+      if (!fopen_s(&fCalib, "calib2.csv", "a+t")) {
+        char calStr[64];
+        int len = sprintf_s(calStr, sizeof(calStr), "%d, %.2f, %d, %6d, %d, %d\n", 
+                            board, temperature, ref, offset, maxVout[ref], 1000000 * (maxVout[ref] - prevmaxVout) / maxVout[ref]); // PPM change
+        fwrite(calStr, 1, len, fCalib);
+        fclose(fCalib);
+        printf("%s", calStr);
+      }
     }
-
-    settle_ms += 0; // settle_ms / 4;
-  } while (!_kbhit());
-
-  #pragma warning( disable : 6387 )
-  FILE* fCalib;
-  if (!fopen_s(&fCalib, "calib.csv", "a+t")) {
-    char calStr[64];
-    int len = sprintf_s(calStr, sizeof(calStr), "%d, %.2f, %4d, %d\n", board, temperature, offset, ref2p50V);
-    fwrite(calStr, 1, len, fCalib);
-    fclose(fCalib);
   }
-
-  sprintf_s(cmd, sizeof(cmd), "%.3fV", VcalHi);
-  sendPSUCmd(cmd);
-  printf("\n");
+  for (ref = 0; ref < 5; ref++)
+    printf("%d, ", maxVout[ref]);
+  printf("\n\n");
 }
 
 void calibratePowerSupply(void) {
-  R10K = getValue("r");
-  bool adjust = false;
+  bool adjust = true;
   while (1) {
     do calibrateVref(adjust);
     while (!_kbhit());
