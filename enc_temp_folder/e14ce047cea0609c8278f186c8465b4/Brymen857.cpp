@@ -422,7 +422,16 @@ void powerSupplyTest(bool brymenOK) {
 
 signed char ofs[100000];
 
-void meterNoise() {
+int main(int argc, char** argv) {
+  const char* comPort = argc > 1 ? argv[1] : lastActiveComPort();
+  if ((hBrymen = openSerial(comPort)) <= 0) {
+    printf("(Re)connect USB serial adapter or use:  Brymen857 COMnn\n");
+    return -2;
+  }
+  bool brymenOK = getReading(hBrymen) < MinErrVal;
+  if (brymenOK)
+    printf("Brymen connected on %s\n", comPort);
+
   int maxR = 0, minR = 0;
 
   for (int i = 0; i < sizeof(ofs); i++) {
@@ -437,21 +446,8 @@ void meterNoise() {
     }
   }
 
-  // TODO: output WAV file for analysis
   while (1);
-}
 
-int main(int argc, char** argv) {
-  const char* comPort = argc > 1 ? argv[1] : lastActiveComPort();
-  if ((hBrymen = openSerial(comPort)) <= 0) {
-    printf("(Re)connect USB serial adapter or use:  Brymen857 COMnn\n");
-    return -2;
-  }
-  bool brymenOK = getReading(hBrymen) < MinErrVal;
-  if (brymenOK)
-    printf("Brymen connected on %s\n", comPort);
-
-  // meterNoise();
 
   if ((hPSU = openSerial(argc > 2 ? argv[2] : lastActiveComPort())) != INVALID_HANDLE_VALUE
   || (hPSU = openSerial("COM7")) != INVALID_HANDLE_VALUE
