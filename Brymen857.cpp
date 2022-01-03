@@ -8,57 +8,12 @@
 #include "setupapi.h"
 #pragma comment(lib, "setupAPI.lib")
 
+const char* comPort = "COM31"; // Tx = DTR
 const int Brymen857Baud = 1000000 / 128;  // 128us per bit
 
-const char* lastActiveComPort() { // to default to last USB serial adapter plugged in
-  static char comPortName[8] = "none";
-  HDEVINFO hDevInfo = SetupDiGetClassDevs(&GUID_CLASS_COMPORT, NULL, NULL, DIGCF_PRESENT | DIGCF_DEVICEINTERFACE);
-  FILETIME latest = { 0 };
+const int MAX_NAVG = 8 + 1;
 
-  for (int index = 0; ; index++) {
-    SP_DEVINFO_DATA DeviceInfoData;
-    DeviceInfoData.cbSize = sizeof(DeviceInfoData);
-    if (!SetupDiEnumDeviceInfo(hDevInfo, index, &DeviceInfoData)) break;
-
-    char hardwareID[256];
-    SetupDiGetDeviceRegistryProperty(hDevInfo, &DeviceInfoData, SPDRP_HARDWAREID, NULL, (BYTE*)hardwareID, sizeof(hardwareID), NULL);
-
-    // truncate to make registry key for common USB CDC devices:
-    char* truncate;
-    if ((truncate = strstr(hardwareID, "&REV"))) *truncate = 0;
-    if ((truncate = strstr(hardwareID, "\\COMPORT"))) *truncate = 0;  // FTDI 
-
-    char devKeyName[256] = "System\\CurrentControlSet\\Enum\\";
-    strcat_s(devKeyName, sizeof(devKeyName), hardwareID);
-    HKEY devKey = 0;
-    LSTATUS res = RegOpenKeyEx(HKEY_LOCAL_MACHINE, devKeyName, 0, KEY_READ, &devKey);
-    if (devKey) {
-      DWORD idx = 0;
-      while (1) {
-        char serNum[64]; DWORD len = sizeof(serNum);
-        FILETIME lastWritten = { 0 }; // 100 ns
-        if (RegEnumKeyEx(devKey, idx++, serNum, &len, NULL, NULL, NULL, &lastWritten)) break;
-        if (CompareFileTime(&lastWritten, &latest) > 0) { // latest device connected
-          latest = lastWritten;
-          if (strstr(devKeyName, "FTDIBUS")) strcat_s(serNum, sizeof(serNum), "\\0000"); // TODO: enumerate FTDI?
-          strcat_s(serNum, sizeof(serNum), "\\Device Parameters");
-          len = sizeof(comPortName);
-          RegGetValue(devKey, serNum, "PortName", RRF_RT_REG_SZ, NULL, comPortName, &len);
-          // SetupDiGetDeviceRegistryProperty(hDevInfo, &DeviceInfoData, SPDRP_FRIENDLYNAME, NULL, (BYTE*)devName, sizeof(devName), NULL);        
-        }
-      }
-      RegCloseKey(devKey);
-    }
-    else if (strstr(hardwareID, "USB")) printf("%s not found", devKeyName); // low numbered non-removable ports ignored
-  }
-
-  SetupDiDestroyDeviceInfoList(hDevInfo);
-  return comPortName;
-
-  // see also HKEY_LOCAL_MACHINE\HARDWARE\DEVICEMAP\SERIALCOMM
-  //   to check disconnect removed from list
-  //   can't tell which is last enumerated
-}
+DCB dcb;
 
 HANDLE openSerial(const char* portName) {
   char portDev[16] = "\\\\.\\";
@@ -66,11 +21,11 @@ HANDLE openSerial(const char* portName) {
   HANDLE hCom = CreateFileA(portDev, GENERIC_READ | GENERIC_WRITE, 0, NULL, OPEN_EXISTING, NULL, NULL);
   if (hCom == INVALID_HANDLE_VALUE) return hCom;
 
-  DCB dcb = { 0 };
   dcb.DCBlength = sizeof(DCB);
   dcb.BaudRate = Brymen857Baud;
   dcb.ByteSize = 8;
   dcb.fBinary = TRUE;
+  dcb.fDtrControl = DTR_CONTROL_DISABLE;
   if (!SetCommState(hCom, &dcb)) return 0;
   if (!SetupComm(hCom, 16, 64)) return 0;
 
@@ -91,7 +46,6 @@ typedef struct {
 } rawData;
 
 rawData raw[RawLen];
-
 
 // TODO: fill in unknown LCD bits
 
@@ -250,21 +204,23 @@ double decodeRaw(bool doUnits = true) {
   return reading;
 }
 
-double getReading(HANDLE hCom) {
-  bool ret = SetCommBreak(hCom); // TxD low -> IRED on
-  if (!ret) printf("Break not supported\n");
-  // Sleep(10);
-  // ret = ClearCommBreak(hCom); // Txd high -> IRED off
-  // NOTE: can leave Tx IRED on constantly
+HANDLE hBrymen, hPSU;
+
+double getReading() {
+  dcb.fDtrControl = DTR_CONTROL_ENABLE; // low -> IRED on
+  SetCommState(hBrymen, &dcb);
 
   DWORD bytesRead;
-  if (!ReadFile(hCom, raw, RawLen, &bytesRead, NULL)) return 0;
+  if (!ReadFile(hBrymen, raw, RawLen, &bytesRead, NULL)) return 0;
   if (bytesRead != RawLen) return 9E9;  // TODO: retry
+
+  dcb.fDtrControl = DTR_CONTROL_DISABLE;
+  SetCommState(hBrymen, &dcb);
   
   return decodeRaw();
 }
 
-HANDLE hBrymen, hPSU;
+
 
 void sendPSUCmd(const char* cmd) {
   WriteFile(hPSU, cmd, (DWORD)strlen(cmd), NULL, NULL);
@@ -290,20 +246,21 @@ int settle_ms = 8000;
 // set to range of interest:
 const double VcalLo = 3;
 const double VcalHi = 5;  // 50000/500000 counts
-
-const int NAVG = 1024 * 2 + 1;  // 400 ms? sampling beats with 60 Hz
-double val[NAVG];
+double val[MAX_NAVG];
 
 // beware synchronizing with noise???
-double avgReading(HANDLE hMeter) { // median
+
+double avgReading(int nAvg) { // median
   sendPSUCmd(cmd);
   Sleep(settle_ms);
 
   while (1) {    
-    for (int n = 0; n < NAVG; n++) {
+    for (int n = 0; n < nAvg; n++) {
       double newval;
-      do newval = getReading(hMeter); while (newval >= MinErrVal);
-      if (0) { // sort
+      do newval = getReading(); 
+      while (newval >= MinErrVal);
+
+      if (1) { // sort
         int newpos = n;
         for (int i = 0; i < n; i++)
           if (newval < val[i]) {   // keep sorted
@@ -316,13 +273,14 @@ double avgReading(HANDLE hMeter) { // median
       } else val[n] = newval;
     }
 
-    double p2p = 1E6 * fabs(val[NAVG - 1] - val[0]);
-    printf(" %.5f %.5f", val[0], val[NAVG - 1]);
-    if (p2p > 2000) {
+    printf(" %.5f %.5f", val[0], val[nAvg - 1]);
+    double p2p = 1E6 * fabs(val[nAvg - 1] - val[0]);
+    if (p2p > 2000) { // 2 mV noise
       printf("!");
       Sleep(settle_ms);
+      // try again
     } else 
-      return val[NAVG / 2]; // median
+      return val[nAvg / 2]; // median
   }
 }
 
@@ -332,13 +290,13 @@ double readLoV, readHiV;
 int maxVout[5], offset;
 int ref;
 
-void readLoHiV() {
+void readLoHiV(int nAvg) {
   sprintf_s(cmd, sizeof(cmd), "+%dD", dacLo = int(DAC_SCALE * (VcalLo * 1E6 + offset) / maxVout[ref] + 0.5));
-  readLoV = avgReading(hBrymen);
+  readLoV = avgReading(nAvg);
   printf(" %.5f", readLoV);
 
   sprintf_s(cmd, sizeof(cmd), "+%dD", dacHi = int(DAC_SCALE * (VcalHi * 1E6 + offset) / maxVout[ref] + 0.5));
-  readHiV = avgReading(hBrymen);
+  readHiV = avgReading(nAvg);
   printf(" %.5f", readHiV);
 }
 
@@ -347,7 +305,7 @@ void readLoHiV() {
 
 int board;
 
-void calibrateVref(bool adjust = true) { // and offset 
+void calibrateVref(int nAvg, bool adjust = true) { // and offset 
   for (ref = 0; ref < 1; ref += 4) {  // 1.25 (and Vdd)
     Sleep(100);
     sprintf_s(cmd, sizeof(cmd), "+%d ", ref); // set param0 = REFSEL
@@ -360,26 +318,29 @@ void calibrateVref(bool adjust = true) { // and offset
 
     double temperature = getValue("t") / 100.;
     
-    readLoHiV();
-    if (adjust) {
-      maxVout[ref] = int(1E6 * (readHiV - readLoV) * DAC_SCALE / (dacHi - dacLo) + 0.5); // uV
-      offset = -int(1E6 * (readLoV * dacHi - readHiV * dacLo) / (dacHi - dacLo) + 0.5); // uV at output
-      // char cmd[32];
-      // sprintf_s(cmd, sizeof(cmd), "+%dO+%dB", offset, maxVout[ref]);
-      // sendPSUCmd(cmd);
+    readLoHiV(nAvg);
 
-      char calStr[64];
-      int len = sprintf_s(calStr, sizeof(calStr), "%d, %d, %.2f, %6d, %d, %d\n",
-        board, ref, temperature, offset, maxVout[ref], 1000000 * (maxVout[ref] - prevmaxVout) / maxVout[ref]); // PPM change
-      printf("  %s", calStr);
+    maxVout[ref] = int(1E6 * (readHiV - readLoV) * DAC_SCALE / (dacHi - dacLo) + 0.5); // uV
+    offset = -int(1E6 * (readLoV * dacHi - readHiV * dacLo) / (dacHi - dacLo) + 0.5); // uV at output
 
-      FILE* fCalib;
-      if (!fopen_s(&fCalib, "calibt.csv", "a+t")) {
-        fwrite(calStr, 1, len, fCalib);
-        fclose(fCalib);
-      }
+    if (adjust) {  // TODO: copy to flash array in source
+      char cmd[32];
+      sprintf_s(cmd, sizeof(cmd), "+%dO+%dB", offset, maxVout[ref]);
+      sendPSUCmd(cmd);
     }
+
+    char calStr[64];
+    int len = sprintf_s(calStr, sizeof(calStr), "%d, %d, %.2f, %6d, %d, %d\n",
+      board, ref, temperature, offset, maxVout[ref], 1000000 * (maxVout[ref] - prevmaxVout) / maxVout[ref]); // PPM change
+    printf("  %s", calStr);
+
+    FILE* fCalib;
+    if (!fopen_s(&fCalib, "calibt.csv", "a+t")) {
+      fwrite(calStr, 1, len, fCalib);
+      fclose(fCalib);
+    }    
   }
+
 #if 0
   for (ref = 0; ref < 5; ref++)
     printf("%d, ", maxVout[ref]);
@@ -389,10 +350,12 @@ void calibrateVref(bool adjust = true) { // and offset
 
 void calibratePowerSupply(void) {
   bool adjust = true;
+  int nAvg = 3;
   while (1) {
-    do calibrateVref(adjust);
+    do calibrateVref(nAvg, adjust);
     while (!_kbhit());
     adjust = _getch() == 'a';
+    nAvg = min(MAX_NAVG, nAvg * 2 + 1);
   }
 
   for (double volts = 0.5; volts <= 36; volts += max(0.02, volts / 30)) {
@@ -400,7 +363,7 @@ void calibratePowerSupply(void) {
     sprintf_s(setVolts, sizeof(setVolts), "%.3fV", volts);
     WriteFile(hPSU, setVolts, (DWORD)strlen(setVolts), NULL, NULL);
     Sleep(3000);
-    double reading = getReading(hBrymen);
+    double reading = getReading();
     printf("%.3f, %.5f, %.5f\n", volts, volts - reading, reading);
     // to CSV file also
   }
@@ -426,7 +389,7 @@ void meterNoise() {
   int maxR = 0, minR = 0;
 
   for (int i = 0; i < sizeof(ofs); i++) {
-    ofs[i] = (int)(getReading(hBrymen) * 1E5);
+    ofs[i] = (int)(getReading() * 1E5);
     if (ofs[i] > maxR) {
       maxR = ofs[i];
       printf("%d ", maxR);
@@ -442,26 +405,42 @@ void meterNoise() {
 }
 
 int main(int argc, char** argv) {
-  const char* comPort = argc > 1 ? argv[1] : lastActiveComPort();
-  if ((hBrymen = openSerial(comPort)) <= 0) {
-    printf("(Re)connect USB serial adapter or use:  Brymen857 COMnn\n");
+  if ((hBrymen = openSerial(comPort)) <= (HANDLE)0) {
+    printf("Connect Brymen to special %s\n", comPort);
     return -2;
   }
-  bool brymenOK = getReading(hBrymen) < MinErrVal;
+  bool brymenOK = getReading() < MinErrVal;
   if (brymenOK)
     printf("Brymen connected on %s\n", comPort);
 
   // meterNoise();
-
-  if ((hPSU = openSerial(argc > 2 ? argv[2] : lastActiveComPort())) != INVALID_HANDLE_VALUE
-  || (hPSU = openSerial("COM7")) != INVALID_HANDLE_VALUE
-  || (hPSU = openSerial("COM8")) != INVALID_HANDLE_VALUE)
+#if 1
+  if ((hPSU = openSerial("COM7")) != INVALID_HANDLE_VALUE
+  ||  (hPSU = openSerial("COM8")) != INVALID_HANDLE_VALUE)
     powerSupplyTest(brymenOK);
+#endif
 
   if (brymenOK) while (1) {
-    double reading = getReading(hBrymen);
-    if (reading < MinErrVal)
-      printf("%s %s%s %s %s\n", numStr, range, units, acdc, modifier);    
+    double reading = getReading();
+    if (reading >= MinErrVal) continue;
+
+    static double minReading = 9E9;
+    static double maxReading = -9E9;
+    bool newExtremum = false;
+    if (reading < minReading) {
+      minReading = reading; 
+      newExtremum = true;
+    }
+
+    if (reading > maxReading) {
+      maxReading = reading;
+      newExtremum = true;
+    } 
+    if (newExtremum)
+      printf("\r%.5f - %.5f  %.2f", minReading, maxReading, (maxReading-minReading) * 1000);
+    
+    //if (reading < MinErrVal)
+    //  printf("%s %s%s %s %s\n", numStr, range, units, acdc, modifier);    
   } 
   
   CloseHandle(hBrymen);
